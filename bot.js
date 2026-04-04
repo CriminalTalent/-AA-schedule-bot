@@ -5,16 +5,17 @@ import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
 import {
   getAge,
-  getPhase,
   validateSchedule,
   applyActions,
   buildStatusLine,
+  PUBLIC_STATS,
+  HIDDEN_STATS,
+  clamp,
 } from "./game.js";
 import {
   getPlayer,
   updatePlayer,
   getAllPlayers,
-  processPlayer,
   hasSubmittedThisTurn,
   isEnded,
 } from "./storage.js";
@@ -22,7 +23,6 @@ import {
 const GM_ID        = process.env.GM_ACCOUNT_ID ?? "";
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const INSTANCE_URL = process.env.MASTODON_URL;
-const MAX_TURNS    = Number(process.env.MAX_TURNS ?? 24);
 
 if (!BOT_TOKEN || !INSTANCE_URL) {
   console.error(".env 설정 필요: MASTODON_URL, BOT_TOKEN");
@@ -117,16 +117,8 @@ async function handleSchedule(notification, accountId, displayName, scheduleToke
     return;
   }
 
-  // 행동 적용
-  const updated = await processPlayer(accountId, (p) => {
-    // applyActions는 async지만 processPlayer 내부에서는 동기 함수만 허용
-    // 때문에 아래에서 별도 처리
-    return p;
-  });
-
-  // applyActions는 async이므로 processPlayer 밖에서 처리
-  const raw     = await getPlayer(accountId, displayName);
-  const applied = await applyActions(raw, actions);
+  // 행동 적용 (applyActions는 async이므로 updatePlayer 직접 호출)
+  const applied = await applyActions(player, actions);
   await updatePlayer(applied);
 
   const lastHistory = applied.history.at(-1);
@@ -172,12 +164,13 @@ async function handleGMStatus(notification) {
   }
 
   const lines = players.map((p) => {
-    const lastTurn = p.history.at(-1)?.turn ?? 0;
-    const flag     = lastTurn === p.turn - 1 ? "[완료]" : "[대기]";
-    const hasAdv   = p.history.at(-1)?.actions?.includes("무사수행") ?? false;
-    const advDone  = p.history.at(-1)?.adventureResult != null;
-    const advFlag  = hasAdv ? (advDone ? "[무사수행완료]" : "[무사수행대기]") : "";
-    return `${flag} ${p.name} / ${p.turn - 1}턴 완료 ${advFlag} / 스트레스:${p.hidden.스트레스} 위험도:${p.hidden.위험도}`;
+    const lastHistory = p.history.at(-1);
+    const submitted   = lastHistory?.turn === p.turn - 1;
+    const flag        = submitted ? "[완료]" : "[대기]";
+    const hasAdv      = lastHistory?.actions?.includes("무사수행") ?? false;
+    const advDone     = lastHistory?.adventureResult != null;
+    const advFlag     = hasAdv ? (advDone ? " [무사수행완료]" : " [무사수행대기]") : "";
+    return `${flag} ${p.name} / ${p.turn - 1}턴 완료${advFlag} / 스트레스:${p.hidden.스트레스} 위험도:${p.hidden.위험도}`;
   });
 
   await reply(notification, `[전체 현황]\n${lines.join("\n")}`);
@@ -196,10 +189,10 @@ async function handleGMDetail(notification, targetName) {
   }
 
   for (const p of list) {
-    const pub    = Object.entries(p.stats).map(([k, v])  => `${k}:${v}`).join(" ");
-    const hidden = Object.entries(p.hidden).map(([k, v]) => `${k}:${v}`).join(" ");
-    const inv    = p.inventory.length > 0 ? p.inventory.join(", ") : "없음";
-    const equip  = Object.entries(p.equipped).length > 0
+    const pub      = Object.entries(p.stats).map(([k, v])  => `${k}:${v}`).join(" ");
+    const hidden   = Object.entries(p.hidden).map(([k, v]) => `${k}:${v}`).join(" ");
+    const inv      = p.inventory.length > 0 ? p.inventory.join(", ") : "없음";
+    const equip    = Object.entries(p.equipped).length > 0
       ? Object.entries(p.equipped).map(([slot, name]) => `${slot}:${name}`).join(" ")
       : "없음";
 
@@ -242,7 +235,7 @@ async function handleGMGold(notification, targetName, amountStr) {
     return;
   }
 
-  const amount  = parseInt(amountStr, 10);
+  const amount = parseInt(amountStr, 10);
   if (isNaN(amount)) {
     await reply(notification, "금액은 정수로 입력해주세요.");
     return;
@@ -255,9 +248,10 @@ async function handleGMGold(notification, targetName, amountStr) {
     return;
   }
 
-  await updatePlayer({ ...target, gold: target.gold + amount });
+  const newGold = target.gold + amount;
+  await updatePlayer({ ...target, gold: newGold });
   await reply(notification,
-    `[${targetName}] 골드 ${amount > 0 ? "+" : ""}${amount}G 지급 완료.\n현재 잔액: ${target.gold + amount}G`
+    `[${targetName}] 골드 ${amount > 0 ? "+" : ""}${amount}G 지급 완료.\n현재 잔액: ${newGold}G`
   );
 }
 
@@ -268,7 +262,7 @@ async function handleGMStat(notification, targetName, statName, valueStr) {
     return;
   }
 
-  const value   = parseInt(valueStr, 10);
+  const value = parseInt(valueStr, 10);
   if (isNaN(value)) {
     await reply(notification, "값은 정수로 입력해주세요.");
     return;
@@ -281,25 +275,21 @@ async function handleGMStat(notification, targetName, statName, valueStr) {
     return;
   }
 
-  const PUBLIC_STATS = ["지능", "매력", "체력", "감성", "사회성"];
-  const HIDDEN_STATS = ["도덕성", "야망", "위험도", "의존성", "스트레스", "평판", "전투"];
-  const clamp = (v) => Math.min(100, Math.max(0, v));
-
   let updated;
   if (PUBLIC_STATS.includes(statName)) {
-    updated = { ...target, stats: { ...target.stats, [statName]: clamp(value) } };
+    updated = { ...target, stats:  { ...target.stats,  [statName]: clamp(value, 0, 100) } };
   } else if (HIDDEN_STATS.includes(statName)) {
-    updated = { ...target, hidden: { ...target.hidden, [statName]: clamp(value) } };
+    updated = { ...target, hidden: { ...target.hidden, [statName]: clamp(value, 0, 100) } };
   } else {
     await reply(notification, `'${statName}'은(는) 없는 수치입니다.`);
     return;
   }
 
   await updatePlayer(updated);
-  await reply(notification, `[${targetName}] ${statName} → ${clamp(value)} 조정 완료.`);
+  await reply(notification, `[${targetName}] ${statName} → ${clamp(value, 0, 100)} 조정 완료.`);
 }
 
-// [공지/내용] — GM 공지를 공개 게시
+// [공지/내용] — 공개 게시판에 공지 포스팅
 async function handleGMAnnounce(notification, content) {
   if (!content) {
     await reply(notification, "사용법: [공지/내용]");
@@ -358,13 +348,19 @@ async function handleNotification(notification) {
         break;
 
       case "골드지급": {
-        const parts = token.value?.split(",") ?? [];
-        await handleGMGold(notification, parts[0]?.trim(), parts[1]?.trim());
+        // [골드지급/이름/금액] → 슬래시 3개 구조이므로 원문에서 재파싱
+        const raw   = notification.status.content.replace(/<[^>]+>/g, " ");
+        const match = raw.match(/\[골드지급\/([^/]+)\/([^\]]+)\]/);
+        if (match) {
+          await handleGMGold(notification, match[1].trim(), match[2].trim());
+        } else {
+          await reply(notification, "사용법: [골드지급/플레이어명/금액]");
+        }
         break;
       }
 
       case "수치조정": {
-        // [수치조정/이름/수치명/값] → value = "이름", extra 없으므로 토큰 재파싱
+        // [수치조정/이름/수치명/값] → 슬래시 4개 구조이므로 원문에서 재파싱
         const raw   = notification.status.content.replace(/<[^>]+>/g, " ");
         const match = raw.match(/\[수치조정\/([^/]+)\/([^/]+)\/([^\]]+)\]/);
         if (match) {
